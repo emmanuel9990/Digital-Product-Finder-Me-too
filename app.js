@@ -80,7 +80,7 @@ stationButtons.forEach((btn) => {
 
 // ---------- Gemini call ----------
 
-async function callGemini(prompt) {
+async function callGemini(prompt, options = {}) {
   const apiKey = getApiKey();
   if (!apiKey) {
     settingsDialog.showModal();
@@ -90,12 +90,22 @@ async function callGemini(prompt) {
   const model = getModel();
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }],
+  };
+  // Grounds the response in real, current Google Search results — used for
+  // Autopilot's market/topic research calls, not the short planning prompts.
+  if (options.useSearch) {
+    body.tools = [{ google_search: {} }];
+  }
+  if (options.maxOutputTokens) {
+    body.generationConfig = { maxOutputTokens: options.maxOutputTokens };
+  }
+
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
@@ -777,4 +787,412 @@ window.addEventListener('DOMContentLoaded', () => {
     showToast('Add your free Gemini API key to get started.');
   }
 });
+
+// ---------- Autopilot ----------
+// A self-contained, multi-step flow: research real market gaps → let the user
+// pick one → research that topic for real → write it chapter by chapter →
+// let the user edit → produce ONE finished long-form PDF of the product
+// itself. The planning stations above (blueprint, pricing, etc.) are never
+// shown to the eventual buyer — this flow never touches or displays them.
+
+const autopilotDialog = document.getElementById('autopilotDialog');
+const autopilotContent = document.getElementById('autopilotContent');
+const CHAPTER_COUNT = 12;
+const CHAPTER_DELAY_MS = 1800; // spaced out to stay under free-tier rate limits
+
+let apState = null;
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function apSetContent(html) {
+  autopilotContent.innerHTML = html;
+}
+
+function bindApClose() {
+  const btn = document.getElementById('apCloseBtn');
+  if (btn) btn.addEventListener('click', () => autopilotDialog.close());
+}
+
+function apLoadingView(stepTag, title, message) {
+  apSetContent(`
+    <p class="step-tag">${escapeHtml(stepTag)}</p>
+    <h2>${escapeHtml(title)}</h2>
+    <div class="ap-loading">
+      <div class="ap-spinner"></div>
+      <div class="ap-loading__msg">${escapeHtml(message)}</div>
+    </div>
+  `);
+}
+
+function renderApError(title, message, retryFn) {
+  apSetContent(`
+    <p class="step-tag">Autopilot</p>
+    <h2>${escapeHtml(title)}</h2>
+    <p class="error">${escapeHtml(message)}</p>
+    <div class="autopilot-content__actions">
+      <button class="ghost" id="apCloseBtn" type="button">Close</button>
+      <button class="run" id="apRetryBtn" type="button">Try again</button>
+    </div>
+  `);
+  bindApClose();
+  document.getElementById('apRetryBtn').addEventListener('click', retryFn);
+}
+
+document.getElementById('autopilotBtn').addEventListener('click', () => {
+  apState = { options: [], chosen: null, research: '', outline: [], chapters: [], fullText: '' };
+  autopilotDialog.showModal();
+  runMarketResearch();
+});
+
+// ---------- Step 1: find 3 real market gaps ----------
+
+function buildMarketOptionsPrompt() {
+  return `You are a market researcher for digital products (written guides/ebooks). Use real, current search results to find genuine content gaps — topics where people are actively searching for help right now, but the existing free and paid content online is thin, outdated, or unsatisfying.
+
+Find exactly 3 different topics like this, spread across different areas of life so they're meaningfully different from each other. For each, respond in exactly this block format, with each block separated by a line containing only ---:
+
+NAME: [a clear, specific working title for a guide on this topic]
+AUDIENCE: [who searches for this help, specifically]
+GAP: [1-2 sentences on what's missing from what's currently out there, grounded in what you found]
+PROMISE: [one sentence on the concrete result/outcome this guide would deliver]
+
+No preamble, no numbering, no closing remarks — just the 3 blocks separated by ---.`;
+}
+
+function parseOptionsText(text) {
+  const blocks = text.split(/-{3,}/).map((b) => b.trim()).filter(Boolean);
+  return blocks
+    .map((block) => {
+      const get = (label) => {
+        const m = block.match(new RegExp(`${label}\\s*:\\s*(.+)`, 'i'));
+        return m ? m[1].trim() : '';
+      };
+      return {
+        name: get('NAME'),
+        audience: get('AUDIENCE'),
+        gap: get('GAP'),
+        promise: get('PROMISE'),
+      };
+    })
+    .filter((o) => o.name)
+    .slice(0, 3);
+}
+
+async function runMarketResearch() {
+  apLoadingView('Autopilot · Step 1 of 3', 'Scanning for a real opportunity', 'Searching for underserved topics people are actively searching help for…');
+  try {
+    const text = await callGemini(buildMarketOptionsPrompt(), { useSearch: true });
+    const options = parseOptionsText(text);
+    if (options.length === 0) throw new Error('Could not read back a clear set of options — try again.');
+    apState.options = options;
+    renderOptionsView();
+  } catch (err) {
+    renderApError('Could not research product options', err.message || 'Something went wrong.', runMarketResearch);
+  }
+}
+
+function renderOptionsView() {
+  const cards = apState.options
+    .map(
+      (opt, i) => `
+    <div class="ap-option">
+      <span class="ap-option__label">Option ${i + 1}</span>
+      <h3>${escapeHtml(opt.name)}</h3>
+      <p><strong>For:</strong> ${escapeHtml(opt.audience)}</p>
+      <p><strong>The gap:</strong> ${escapeHtml(opt.gap)}</p>
+      <p><strong>Promise:</strong> ${escapeHtml(opt.promise)}</p>
+      <button class="run" data-choose="${i}" type="button">Build this one</button>
+    </div>`
+    )
+    .join('');
+
+  apSetContent(`
+    <p class="step-tag">Autopilot · Step 1 of 3</p>
+    <h2>Three real openings found</h2>
+    <p>Pick the one you want turned into a finished, ready-to-sell guide. Everything from here happens automatically until the review step.</p>
+    <div class="ap-options">${cards}</div>
+    <div class="autopilot-content__actions">
+      <button class="ghost" id="apCloseBtn" type="button">Close</button>
+      <button class="ghost" id="apRegenBtn" type="button">Search again</button>
+    </div>
+  `);
+  bindApClose();
+  document.getElementById('apRegenBtn').addEventListener('click', runMarketResearch);
+  document.querySelectorAll('[data-choose]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      apState.chosen = apState.options[Number(btn.dataset.choose)];
+      runTopicResearch();
+    });
+  });
+}
+
+// ---------- Step 2: research the chosen topic, then plan chapters ----------
+
+function buildTopicResearchPrompt(opt) {
+  return `You're gathering real, current, factual research notes to help write a comprehensive guide.
+
+Topic: "${opt.name}"
+Audience: ${opt.audience}
+The guide should deliver on this promise: "${opt.promise}"
+
+Use search to find real, current, credible information: context/causes, expert-recommended approaches, common mistakes, and any useful current data points. Organize as dense factual notes under short headings — no fluff, written as source material for someone about to write a guide, not for a reader directly.
+
+Keep it under 600 words. No preamble.`;
+}
+
+async function runTopicResearch() {
+  apLoadingView('Autopilot · Step 2 of 3', 'Researching your chosen topic', `Gathering real, current information on "${apState.chosen.name}"…`);
+  try {
+    apState.research = await callGemini(buildTopicResearchPrompt(apState.chosen), { useSearch: true });
+    await runOutline();
+  } catch (err) {
+    renderApError('Could not complete the research step', err.message || 'Something went wrong.', runTopicResearch);
+  }
+}
+
+function buildOutlinePrompt(opt, research) {
+  return `Create a chapter outline for a comprehensive, practical guide.
+
+Title: "${opt.name}"
+Audience: ${opt.audience}
+Promise: "${opt.promise}"
+
+Research notes to ground it in:
+"""
+${research}
+"""
+
+Respond with exactly ${CHAPTER_COUNT} lines, one per chapter, in this exact format and nothing else:
+1. Chapter title — one-sentence goal for the chapter
+2. Chapter title — one-sentence goal for the chapter
+...continuing through ${CHAPTER_COUNT}.
+
+Order chapters logically: understanding/context first, then practical steps, then troubleshooting or staying on track, then a closing chapter. No preamble, no other text.`;
+}
+
+function parseOutline(text) {
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+  const result = [];
+  for (const line of lines) {
+    const numMatch = line.match(/^\d+[.)]\s*(.+)$/);
+    if (!numMatch) continue;
+    const rest = numMatch[1];
+    const sep = rest.match(/^(.*?)\s*[—–-]\s*(.+)$/);
+    if (sep) {
+      result.push({ title: sep[1].trim(), goal: sep[2].trim() });
+    } else {
+      result.push({ title: rest.trim(), goal: '' });
+    }
+  }
+  return result;
+}
+
+async function runOutline() {
+  apLoadingView('Autopilot · Step 2 of 3', 'Structuring the guide', 'Planning out the chapters…');
+  try {
+    const text = await callGemini(buildOutlinePrompt(apState.chosen, apState.research));
+    const outline = parseOutline(text);
+    if (outline.length < 6) throw new Error('Could not read back a clear chapter outline — try again.');
+    apState.outline = outline;
+    await runChapters();
+  } catch (err) {
+    renderApError('Could not plan the guide structure', err.message || 'Something went wrong.', runOutline);
+  }
+}
+
+// ---------- Step 3: write every chapter, then hand off for review ----------
+
+function buildChapterPrompt(opt, chapter, research) {
+  return `Write one chapter of a comprehensive, practical guide.
+
+Guide title: "${opt.name}"
+Audience: ${opt.audience}
+Chapter: "${chapter.title}"
+Goal of this chapter: ${chapter.goal}
+
+Research notes to draw on where relevant:
+"""
+${research}
+"""
+
+Write 550-750 words of the chapter body only — direct, practical, second-person voice, no fluff or filler, no restating the chapter title, no preamble or meta-commentary about the guide itself. Use occasional "- " bullet lists for concrete steps where that helps. Start directly with the first sentence of the chapter content.`;
+}
+
+function renderProgressView(current) {
+  const items = apState.outline
+    .map((ch, i) => {
+      const state = i < current ? 'done' : i === current ? 'active' : '';
+      const mark = i < current ? '✓' : i === current ? '…' : '';
+      return `<li class="${state}"><span class="dot"></span>${escapeHtml(ch.title)}${mark ? ` <span>${mark}</span>` : ''}</li>`;
+    })
+    .join('');
+  apSetContent(`
+    <p class="step-tag">Autopilot · Step 2 of 3</p>
+    <h2>Writing "${escapeHtml(apState.chosen.name)}"</h2>
+    <p>Chapter ${Math.min(current + 1, apState.outline.length)} of ${apState.outline.length}. This takes a few minutes — the app is pacing itself to stay within the free API's rate limit.</p>
+    <ul class="ap-progresslist">${items}</ul>
+  `);
+}
+
+async function runChapters() {
+  apState.chapters = [];
+  for (let i = 0; i < apState.outline.length; i++) {
+    renderProgressView(i);
+    const chapter = apState.outline[i];
+    try {
+      const body = await callGemini(buildChapterPrompt(apState.chosen, chapter, apState.research), { maxOutputTokens: 2048 });
+      apState.chapters.push({ title: chapter.title, body });
+    } catch (err) {
+      renderApError(`Could not write chapter ${i + 1} ("${chapter.title}")`, err.message || 'Something went wrong.', runChapters);
+      return;
+    }
+    if (i < apState.outline.length - 1) await wait(CHAPTER_DELAY_MS);
+  }
+  assembleFullText();
+  renderEditView();
+}
+
+function assembleFullText() {
+  const opt = apState.chosen;
+  const chaptersText = apState.chapters
+    .map((ch, i) => `## Chapter ${i + 1}: ${ch.title}\n\n${ch.body}`)
+    .join('\n\n');
+  apState.fullText = `# ${opt.name}\n\n${opt.promise}\n\n${chaptersText}`;
+}
+
+// ---------- Step 4: human review/edit before the final PDF ----------
+
+function renderEditView() {
+  const wordCount = apState.fullText.trim().split(/\s+/).length;
+  const approxPages = Math.max(1, Math.round(wordCount / 380));
+  apSetContent(`
+    <p class="step-tag">Autopilot · Step 3 of 3</p>
+    <h2>Review before it becomes a PDF</h2>
+    <p>This is the actual guide your buyer will receive — roughly ${approxPages} pages. Edit anything you want below before finalizing. Lines starting with "##" are chapter headings.</p>
+    <div class="ap-edit">
+      <textarea id="apEditText" spellcheck="false">${escapeHtml(apState.fullText)}</textarea>
+    </div>
+    <div class="autopilot-content__actions">
+      <button class="ghost" id="apCloseBtn" type="button">Close</button>
+      <button class="run" id="apFinalizeBtn" type="button">Finalize &amp; download PDF</button>
+    </div>
+  `);
+  bindApClose();
+  document.getElementById('apFinalizeBtn').addEventListener('click', () => {
+    apState.fullText = document.getElementById('apEditText').value;
+    finalizeProduct();
+  });
+}
+
+// ---------- Step 5: the final PDF is the product itself — no planning trail ----------
+
+function renderBookFormatted(rawText) {
+  const lines = rawText.split('\n');
+  let html = '';
+  let inList = false;
+  let sawChapter = false;
+  const closeList = () => {
+    if (inList) { html += '</ul>'; inList = false; }
+  };
+
+  for (let line of lines) {
+    line = line.trim();
+    if (!line) { closeList(); continue; }
+    if (/^#\s+/.test(line)) continue; // the title line is rendered separately on the title page
+
+    const chapterHeading = line.match(/^##\s+(.*)/);
+    const bullet = line.match(/^[-*]\s+(.*)/);
+    const numbered = line.match(/^\d+[.)]\s+(.*)/);
+
+    if (chapterHeading) {
+      closeList();
+      const cls = sawChapter ? 'book-chapter' : 'book-chapter book-chapter--first';
+      sawChapter = true;
+      html += `<h2 class="${cls}">${escapeHtml(chapterHeading[1])}</h2>`;
+    } else if (bullet || numbered) {
+      if (!inList) { html += '<ul>'; inList = true; }
+      html += `<li>${escapeHtml((bullet || numbered)[1])}</li>`;
+    } else {
+      closeList();
+      html += `<p>${escapeHtml(line)}</p>`;
+    }
+  }
+  closeList();
+  return html;
+}
+
+function finalizeProduct() {
+  const opt = apState.chosen;
+  const bodyHtml = renderBookFormatted(apState.fullText);
+  const win = window.open('', '_blank');
+  if (!win) {
+    showToast('Your browser blocked the print window — allow pop-ups for this page and try again.');
+    return;
+  }
+  win.document.write(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>${escapeHtml(opt.name)}</title>
+<style>
+  body{
+    font-family: Georgia, 'Source Serif 4', serif;
+    max-width:640px;
+    margin:0 auto;
+    padding:0 28px;
+    color:#1c2430;
+    line-height:1.7;
+    font-size:15px;
+  }
+  .titlepage{
+    min-height:90vh;
+    display:flex;
+    flex-direction:column;
+    justify-content:center;
+    text-align:center;
+    page-break-after:always;
+  }
+  .titlepage h1{ font-size:32px; margin-bottom:14px; }
+  .titlepage p{ color:#5c6472; font-size:15px; }
+  h2.book-chapter{
+    font-size:19px;
+    margin-top:0;
+    margin-bottom:14px;
+    padding-top:40px;
+    border-top:1px solid #ccc;
+    page-break-before:always;
+  }
+  h2.book-chapter--first{ page-break-before:auto; border-top:none; padding-top:0; }
+  ul{ padding-left:20px; margin:8px 0; }
+  li{ margin-bottom:6px; }
+  p{ margin:10px 0; }
+  @media print{ body{ margin:0; padding:24px; } }
+</style>
+</head>
+<body>
+  <div class="titlepage">
+    <h1>${escapeHtml(opt.name)}</h1>
+    <p>${escapeHtml(opt.promise)}</p>
+  </div>
+  ${bodyHtml}
+</body>
+</html>`);
+  win.document.close();
+  win.focus();
+  setTimeout(() => win.print(), 400);
+
+  apSetContent(`
+    <p class="step-tag">Autopilot · Done</p>
+    <h2>Your product is ready</h2>
+    <p>A print window opened with the finished guide — choose "Save as PDF" there. It contains only the guide itself, nothing about how it was planned or built.</p>
+    <div class="autopilot-content__actions">
+      <button class="ghost" id="apCloseBtn" type="button">Close</button>
+      <button class="run" id="apReprintBtn" type="button">Open PDF again</button>
+    </div>
+  `);
+  bindApClose();
+  document.getElementById('apReprintBtn').addEventListener('click', finalizeProduct);
+}
 
