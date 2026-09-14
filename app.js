@@ -880,8 +880,10 @@ function parseOptionsText(text) {
     .slice(0, 3);
 }
 
+const AP_STEP_TOTAL = 6;
+
 async function runMarketResearch() {
-  apLoadingView('Autopilot · Step 1 of 3', 'Scanning for a real opportunity', 'Searching for underserved topics people are actively searching help for…');
+  apLoadingView(`Autopilot · Step 1 of ${AP_STEP_TOTAL}`, 'Scanning for a real opportunity', 'Searching for underserved topics people are actively searching help for…');
   try {
     const text = await callGemini(buildMarketOptionsPrompt(), { useSearch: true });
     const options = parseOptionsText(text);
@@ -909,9 +911,9 @@ function renderOptionsView() {
     .join('');
 
   apSetContent(`
-    <p class="step-tag">Autopilot · Step 1 of 3</p>
+    <p class="step-tag">Autopilot · Step 1 of ${AP_STEP_TOTAL}</p>
     <h2>Three real openings found</h2>
-    <p>Pick the one you want turned into a finished, ready-to-sell guide. Everything from here happens automatically until the review step.</p>
+    <p>Pick the one you want turned into a finished, ready-to-sell guide. The other two won't be needed once you choose.</p>
     <div class="ap-options">${cards}</div>
     <div class="autopilot-content__actions">
       <button class="ghost" id="apCloseBtn" type="button">Close</button>
@@ -923,12 +925,13 @@ function renderOptionsView() {
   document.querySelectorAll('[data-choose]').forEach((btn) => {
     btn.addEventListener('click', () => {
       apState.chosen = apState.options[Number(btn.dataset.choose)];
+      apState.options = []; // the other two are discarded — only the chosen one moves forward
       runTopicResearch();
     });
   });
 }
 
-// ---------- Step 2: research the chosen topic, then plan chapters ----------
+// ---------- Step 2: research the chosen topic ----------
 
 function buildTopicResearchPrompt(opt) {
   return `You're gathering real, current, factual research notes to help write a comprehensive guide.
@@ -943,14 +946,30 @@ Keep it under 600 words. No preamble.`;
 }
 
 async function runTopicResearch() {
-  apLoadingView('Autopilot · Step 2 of 3', 'Researching your chosen topic', `Gathering real, current information on "${apState.chosen.name}"…`);
+  apLoadingView(`Autopilot · Step 2 of ${AP_STEP_TOTAL}`, 'Researching your chosen topic', `Gathering real, current information on "${apState.chosen.name}"…`);
   try {
     apState.research = await callGemini(buildTopicResearchPrompt(apState.chosen), { useSearch: true });
-    await runOutline();
+    renderResearchContinue();
   } catch (err) {
     renderApError('Could not complete the research step', err.message || 'Something went wrong.', runTopicResearch);
   }
 }
+
+function renderResearchContinue() {
+  apSetContent(`
+    <p class="step-tag">Autopilot · Step 2 of ${AP_STEP_TOTAL}</p>
+    <h2>Research done for "${escapeHtml(apState.chosen.name)}"</h2>
+    <div class="ap-edit"><textarea readonly spellcheck="false" rows="10">${escapeHtml(apState.research)}</textarea></div>
+    <div class="autopilot-content__actions">
+      <button class="ghost" id="apCloseBtn" type="button">Close</button>
+      <button class="run" id="apContinueBtn" type="button">Continue</button>
+    </div>
+  `);
+  bindApClose();
+  document.getElementById('apContinueBtn').addEventListener('click', runOutline);
+}
+
+// ---------- Step 3: plan the chapters ----------
 
 function buildOutlinePrompt(opt, research) {
   return `Create a chapter outline for a comprehensive, practical guide.
@@ -990,19 +1009,35 @@ function parseOutline(text) {
 }
 
 async function runOutline() {
-  apLoadingView('Autopilot · Step 2 of 3', 'Structuring the guide', 'Planning out the chapters…');
+  apLoadingView(`Autopilot · Step 3 of ${AP_STEP_TOTAL}`, 'Structuring the guide', 'Planning out the chapters…');
   try {
     const text = await callGemini(buildOutlinePrompt(apState.chosen, apState.research));
     const outline = parseOutline(text);
     if (outline.length < 6) throw new Error('Could not read back a clear chapter outline — try again.');
     apState.outline = outline;
-    await runChapters();
+    renderOutlineContinue();
   } catch (err) {
     renderApError('Could not plan the guide structure', err.message || 'Something went wrong.', runOutline);
   }
 }
 
-// ---------- Step 3: write every chapter, then hand off for review ----------
+function renderOutlineContinue() {
+  const items = apState.outline.map((ch, i) => `<li><span class="dot"></span>Chapter ${i + 1}: ${escapeHtml(ch.title)}</li>`).join('');
+  apSetContent(`
+    <p class="step-tag">Autopilot · Step 3 of ${AP_STEP_TOTAL}</p>
+    <h2>${apState.outline.length}-chapter plan is ready</h2>
+    <p>This is the chapter list before any writing happens. Continue to have each chapter written in full.</p>
+    <ul class="ap-progresslist">${items}</ul>
+    <div class="autopilot-content__actions">
+      <button class="ghost" id="apCloseBtn" type="button">Close</button>
+      <button class="run" id="apContinueBtn" type="button">Continue</button>
+    </div>
+  `);
+  bindApClose();
+  document.getElementById('apContinueBtn').addEventListener('click', runChapters);
+}
+
+// ---------- Step 4: write every chapter in full ----------
 
 function buildChapterPrompt(opt, chapter, research) {
   return `Write one chapter of a comprehensive, practical guide.
@@ -1029,7 +1064,7 @@ function renderProgressView(current) {
     })
     .join('');
   apSetContent(`
-    <p class="step-tag">Autopilot · Step 2 of 3</p>
+    <p class="step-tag">Autopilot · Step 4 of ${AP_STEP_TOTAL}</p>
     <h2>Writing "${escapeHtml(apState.chosen.name)}"</h2>
     <p>Chapter ${Math.min(current + 1, apState.outline.length)} of ${apState.outline.length}. This takes a few minutes — the app is pacing itself to stay within the free API's rate limit.</p>
     <ul class="ap-progresslist">${items}</ul>
@@ -1051,7 +1086,7 @@ async function runChapters() {
     if (i < apState.outline.length - 1) await wait(CHAPTER_DELAY_MS);
   }
   assembleFullText();
-  renderEditView();
+  renderChaptersContinue();
 }
 
 function assembleFullText() {
@@ -1062,31 +1097,65 @@ function assembleFullText() {
   apState.fullText = `# ${opt.name}\n\n${opt.promise}\n\n${chaptersText}`;
 }
 
-// ---------- Step 4: human review/edit before the final PDF ----------
+function renderChaptersContinue() {
+  const wordCount = apState.fullText.trim().split(/\s+/).length;
+  const approxPages = Math.max(1, Math.round(wordCount / 380));
+  apSetContent(`
+    <p class="step-tag">Autopilot · Step 4 of ${AP_STEP_TOTAL}</p>
+    <h2>All ${apState.chapters.length} chapters written</h2>
+    <p>The full guide is done — roughly ${approxPages} pages. Continue to review and edit it before it's finalized.</p>
+    <div class="autopilot-content__actions">
+      <button class="ghost" id="apCloseBtn" type="button">Close</button>
+      <button class="run" id="apContinueBtn" type="button">Continue</button>
+    </div>
+  `);
+  bindApClose();
+  document.getElementById('apContinueBtn').addEventListener('click', renderEditView);
+}
+
+// ---------- Step 5: human review/edit of the finished guide ----------
 
 function renderEditView() {
   const wordCount = apState.fullText.trim().split(/\s+/).length;
   const approxPages = Math.max(1, Math.round(wordCount / 380));
   apSetContent(`
-    <p class="step-tag">Autopilot · Step 3 of 3</p>
-    <h2>Review before it becomes a PDF</h2>
-    <p>This is the actual guide your buyer will receive — roughly ${approxPages} pages. Edit anything you want below before finalizing. Lines starting with "##" are chapter headings.</p>
+    <p class="step-tag">Autopilot · Step 5 of ${AP_STEP_TOTAL}</p>
+    <h2>Review the finished guide</h2>
+    <p>This is the actual guide your buyer will receive — roughly ${approxPages} pages. Edit anything you want below, then continue. The download button comes after this.</p>
     <div class="ap-edit">
       <textarea id="apEditText" spellcheck="false">${escapeHtml(apState.fullText)}</textarea>
     </div>
     <div class="autopilot-content__actions">
       <button class="ghost" id="apCloseBtn" type="button">Close</button>
-      <button class="run" id="apFinalizeBtn" type="button">Finalize &amp; download PDF</button>
+      <button class="run" id="apContinueBtn" type="button">Continue</button>
     </div>
   `);
   bindApClose();
-  document.getElementById('apFinalizeBtn').addEventListener('click', () => {
+  document.getElementById('apContinueBtn').addEventListener('click', () => {
     apState.fullText = document.getElementById('apEditText').value;
-    finalizeProduct();
+    renderDownloadView();
   });
 }
 
-// ---------- Step 5: the final PDF is the product itself — no planning trail ----------
+// ---------- Step 6: download — the finished product only, no planning trail ----------
+
+function renderDownloadView() {
+  const wordCount = apState.fullText.trim().split(/\s+/).length;
+  const approxPages = Math.max(1, Math.round(wordCount / 380));
+  apSetContent(`
+    <p class="step-tag">Autopilot · Step 6 of ${AP_STEP_TOTAL}</p>
+    <h2>Ready to download</h2>
+    <p>"${escapeHtml(apState.chosen.name)}" is finished — roughly ${approxPages} pages. The PDF contains only this finished guide, nothing about how it was planned or built.</p>
+    <div class="autopilot-content__actions">
+      <button class="ghost" id="apCloseBtn" type="button">Close</button>
+      <button class="run" id="apDownloadBtn" type="button">Download PDF</button>
+    </div>
+  `);
+  bindApClose();
+  document.getElementById('apDownloadBtn').addEventListener('click', finalizeProduct);
+}
+
+// ---------- The final PDF is the product itself — no planning trail ----------
 
 function renderBookFormatted(rawText) {
   const lines = rawText.split('\n');
@@ -1195,4 +1264,3 @@ function finalizeProduct() {
   bindApClose();
   document.getElementById('apReprintBtn').addEventListener('click', finalizeProduct);
 }
-
